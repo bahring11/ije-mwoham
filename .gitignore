@@ -1,0 +1,12 @@
+# API 키 (절대 올리면 안 됨)
+.env
+.streamlit/secrets.toml
+
+# 서버에서 자동으로 다시 만드는 것들
+chroma_db/
+__pycache__/
+*.pyc
+
+# 안 쓰는 폴더 / 개인 설정
+venv/
+.vscode/

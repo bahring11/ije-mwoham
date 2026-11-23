@@ -1,0 +1,26 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	load_profile(load_profile)
+	ask_steam_id(ask_steam_id)
+	analyze(analyze)
+	retrieve(retrieve)
+	relax(relax)
+	generate(generate)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> load_profile;
+	analyze --> retrieve;
+	load_profile -.-> analyze;
+	load_profile -.-> ask_steam_id;
+	relax --> retrieve;
+	retrieve -.-> generate;
+	retrieve -.-> relax;
+	ask_steam_id --> __end__;
+	generate --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
