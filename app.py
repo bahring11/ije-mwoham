@@ -26,6 +26,7 @@ ss.setdefault("steamid", None)
 ss.setdefault("messages", [])
 ss.setdefault("auto_tried", False)
 ss.setdefault("asked", 0)
+ss.setdefault("memory", {})  # 대화 기억 (이전 질문, 이미 추천한 게임)
 
 
 def load(user_input: str):
@@ -33,7 +34,7 @@ def load(user_input: str):
         sid = resolve_steamid(user_input) if user_input.strip() else None
         prof = agent.load_profile({"steamid": sid}).get("profile") if sid else None
     if prof:
-        ss.profile, ss.steamid, ss.messages = prof, sid, []
+        ss.profile, ss.steamid, ss.messages, ss.memory = prof, sid, [], {}
     else:
         st.error("플레이 기록을 불러오지 못했어요. Steam ID와 프로필 공개 설정을 확인하세요.")
 
@@ -78,7 +79,7 @@ with st.sidebar:
                 "플레이 시간", format="%.0fh", min_value=0, max_value=float(df["시간"].max() or 1))},
         )
         if st.button("대화 지우기", use_container_width=True):
-            ss.messages = []
+            ss.messages, ss.memory = [], {}
             st.rerun()
 
 # ---------------------------------------------------------------- 메인
@@ -137,7 +138,8 @@ if question and not limit_reached:
             box.markdown("".join(buf) + "▌")
 
         agent.on_token = on_token
-        final = {"question": question, "steamid": ss.steamid, "profile": ss.profile}
+        final = {"question": question, "steamid": ss.steamid, "profile": ss.profile,
+                 "history": ss.memory.get("history", []), "exclude": ss.memory.get("exclude", [])}
         answer, details = None, None
         try:
             for chunk in agent.app.stream(dict(final), stream_mode="updates"):
@@ -152,6 +154,7 @@ if question and not limit_reached:
                         status.update(label="추천 답변을 작성하는 중...")
             status.update(label="추천 완료", state="complete")
             answer = final.get("answer", "")
+            agent.remember(ss.memory, question, final)
             if final.get("plan"):
                 details = {
                     "queries": final["plan"].get("queries", []),

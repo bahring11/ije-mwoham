@@ -133,6 +133,8 @@ class State(TypedDict, total=False):
     relax_count: int     # 조건 완화 횟수
     candidates: list     # 검색된 후보 게임
     answer: str          # 최종 답변
+    history: list        # 이전 대화 [{"q": 질문, "recs": [추천한 게임]}] (최근 몇 개)
+    exclude: list        # 이미 추천한 게임 이름 (다시 추천하지 않음)
 
 
 # =====================================================================
@@ -163,9 +165,16 @@ def ask_steam_id(state: State) -> dict:
 def analyze(state: State) -> dict:
     """[노드 2] 한국어 질문 → 영어 검색어(1~3개) + 조건"""
     p = state["profile"]
+    hist = state.get("history") or []
+    prev = "\n".join(f'- "{h["q"]}" → recommended: {", ".join(h["recs"]) or "none"}' for h in hist[-3:])
     prompt = f"""You turn a Korean game-recommendation request into a search plan.
 User's most played games: {', '.join(p['top'])}
-Request: "{state['question']}"
+Previous requests in this conversation (oldest first):
+{prev or '- (none)'}
+New request: "{state['question']}"
+
+If the new request is a follow-up such as "다른 거", "또 추천해줘", "비슷한 거 더",
+keep the conditions (co-op, solo, owned, genre) of the previous request and look for different games.
 
 Return JSON with these keys:
 - "queries": a list of 1-3 short English search queries describing the kind of game wanted
@@ -194,15 +203,16 @@ def build_where(filters: dict, profile: dict) -> dict | None:
 def retrieve(state: State) -> dict:
     """[노드 3] 검색어마다 벡터 DB 검색 → 합치기 → 이미 많이 한 게임 제외"""
     profile = state["profile"]
+    exclude = set(state.get("exclude") or [])
     queries = state["plan"].get("queries") or [state["question"]]
     where = build_where(state["filters"], profile)
-    n_each = max(6, 18 // len(queries))
+    n_each = max(6, 18 // len(queries)) + min(len(exclude), 12)  # 제외할 게임만큼 더 많이 검색
 
     seen, cands = set(), []
     for q in queries:
         res = col.query(query_texts=[q], n_results=n_each, where=where)
         for m, doc, dist in zip(res["metadatas"][0], res["documents"][0], res["distances"][0]):
-            if m["appid"] in seen:
+            if m["appid"] in seen or m["name"] in exclude:
                 continue
             seen.add(m["appid"])
             mine = profile["owned"].get(m["appid"])
@@ -242,6 +252,9 @@ def generate(state: State) -> dict:
         f"    {c['summary']}"
         for i, c in enumerate(state["candidates"])
     )
+    hist = state.get("history") or []
+    prev_txt = "\n".join(f"- 질문: {h['q']} / 추천했던 게임: {', '.join(h['recs']) or '없음'}"
+                         for h in hist[-3:]) or "없음"
     relaxed = ("\n(참고: 조건에 딱 맞는 후보가 부족해서 조건을 조금 넓혀 찾은 후보도 있어. "
                "그런 게임은 어떤 점이 조건과 다른지 짧게 알려줘.)") if state.get("relax_count") else ""
     prompt = f"""너는 스팀 게임 추천 도우미야. 아래 [사용자 정보]와 [후보 게임]만 근거로 답해.
@@ -252,6 +265,9 @@ def generate(state: State) -> dict:
 - 많이 한 게임: {', '.join(p['top'])}
 - 최근 2주 플레이: {', '.join(p['recent']) or '없음'}
 
+[이전 대화]
+{prev_txt}
+
 [질문]
 {state['question']}
 
@@ -260,6 +276,7 @@ def generate(state: State) -> dict:
 
 [답변 규칙]
 - 질문 조건에 가장 잘 맞는 게임 3개를 골라 추천해.
+- 이전 대화에서 이미 추천했던 게임은 다시 추천하지 마.
 - 각 게임마다 왜 이 사용자에게 맞는지 플레이 기록과 연결해서 2~3문장으로 설명해.
 - 보유했지만 거의 안 한 게임이 조건에 맞으면 먼저 추천하고 "이미 갖고 있는 게임"이라고 알려줘.
 - 마지막 줄에 "근거: 내 플레이 기록 · 스토어 게임 설명"이라고 적어.
@@ -315,9 +332,24 @@ LABELS = {
 }
 
 
-def run(question: str, steamid: str | None, profile: dict | None = None) -> dict:
+def recommended_names(answer: str, candidates: list) -> list[str]:
+    """답변에 실제로 등장한 후보 게임 이름 = 이번에 추천한 게임"""
+    return [c["name"] for c in candidates if c["name"] in (answer or "")]
+
+
+def remember(memory: dict, question: str, result: dict):
+    """대화 기억 업데이트: 질문과 추천한 게임을 저장"""
+    recs = recommended_names(result.get("answer", ""), result.get("candidates", []))
+    memory["history"] = (memory.get("history", []) + [{"q": question, "recs": recs}])[-5:]
+    memory["exclude"] = list(dict.fromkeys(memory.get("exclude", []) + recs))
+
+
+def run(question: str, steamid: str | None, profile: dict | None = None,
+        memory: dict | None = None) -> dict:
     """그래프를 실행하면서 지나가는 노드를 출력하고, 최종 상태를 돌려줌"""
-    state: State = {"question": question, "steamid": steamid}
+    memory = memory or {}
+    state: State = {"question": question, "steamid": steamid,
+                    "history": memory.get("history", []), "exclude": memory.get("exclude", [])}
     if profile:
         state["profile"] = profile
     final = dict(state)
@@ -336,6 +368,7 @@ if __name__ == "__main__":
     user = os.getenv("STEAM_ID") or input("Steam ID 또는 프로필 주소: ")
     steamid = resolve_steamid(user)
     profile = None
+    memory = {}  # 대화 기억 (이전 질문, 이미 추천한 게임)
     print("질문을 입력하세요 (빈 줄 입력 시 종료)\n")
 
     while True:
@@ -343,7 +376,7 @@ if __name__ == "__main__":
         if not q:
             break
         try:
-            result = run(q, steamid, profile)
+            result = run(q, steamid, profile, memory)
         except errors.APIError as e:
             print(f"\n[오류] Gemini API {e.code}: {e.message}\n  1분 정도 뒤에 다시 질문하세요.\n")
             continue
@@ -351,6 +384,7 @@ if __name__ == "__main__":
             print(f"\n[오류] {type(e).__name__}: {e}\n")
             continue
         profile = result.get("profile", profile)  # 다음 질문부터는 다시 불러오지 않음
+        remember(memory, q, result)
         if result.get("plan"):
             print(f"\n[검색어] {result['plan'].get('queries')}")
             print(f"[후보] {', '.join(c['name'] for c in result.get('candidates', []))}")
