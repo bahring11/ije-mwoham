@@ -22,6 +22,8 @@ load_dotenv()
 PLAYED_MIN = 600   # 이만큼(분) 이상 플레이한 게임은 추천에서 제외 (10시간)
 MIN_CANDS = 6      # 후보가 이보다 적으면 조건을 완화해서 다시 검색
 MAX_RELAX = 2      # 조건 완화는 최대 2번까지
+DEFAULT_COUNT = 5  # 기본 추천 개수
+MAX_COUNT = 10     # 최대 추천 개수
 
 llm = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY"),
@@ -135,6 +137,7 @@ class State(TypedDict, total=False):
     answer: str          # 최종 답변
     history: list        # 이전 대화 [{"q": 질문, "recs": [추천한 게임]}] (최근 몇 개)
     exclude: list        # 이미 추천한 게임 이름 (다시 추천하지 않음)
+    count: int           # 추천 개수
 
 
 # =====================================================================
@@ -183,12 +186,18 @@ Return JSON with these keys:
   (for example "co-op survival crafting sandbox" and "tactical team shooter").
 - "coop": true if they want to play together with friends, otherwise null
 - "single": true if they want to play alone, otherwise null
-- "owned_only": true only if they want games they already own, otherwise false"""
+- "owned_only": true only if they want games they already own, otherwise false
+- "count": the number of games they explicitly asked for (e.g. "10개" → 10), otherwise null"""
     plan = json.loads(ask_llm(prompt, json_mode=True, light=True))
     if isinstance(plan.get("queries"), str):
         plan["queries"] = [plan["queries"]]
     filters = {k: True for k in ("coop", "single", "owned_only") if plan.get(k)}
-    return {"plan": plan, "filters": filters, "relax_count": 0}
+    try:  # 질문에 숫자가 있으면 그 숫자, 없으면 화면에서 고른 개수
+        count = int(plan.get("count") or state.get("count") or DEFAULT_COUNT)
+    except (TypeError, ValueError):
+        count = state.get("count") or DEFAULT_COUNT
+    count = max(1, min(count, MAX_COUNT))
+    return {"plan": plan, "filters": filters, "relax_count": 0, "count": count}
 
 
 def build_where(filters: dict, profile: dict) -> dict | None:
@@ -206,7 +215,9 @@ def retrieve(state: State) -> dict:
     exclude = set(state.get("exclude") or [])
     queries = state["plan"].get("queries") or [state["question"]]
     where = build_where(state["filters"], profile)
-    n_each = max(6, 18 // len(queries)) + min(len(exclude), 12)  # 제외할 게임만큼 더 많이 검색
+    count = state.get("count") or DEFAULT_COUNT
+    want = max(15, count * 3)  # 추천 개수의 3배만큼 후보 확보
+    n_each = max(6, want // len(queries) + 2) + min(len(exclude), 12)  # 제외할 게임만큼 더 검색
 
     seen, cands = set(), []
     for q in queries:
@@ -227,7 +238,7 @@ def retrieve(state: State) -> dict:
             })
     cands.sort(key=lambda c: c["dist"])
     print(f"      후보 {len(cands)}개 (조건: {state['filters'] or '없음'})")
-    return {"candidates": cands[:15]}
+    return {"candidates": cands[:want]}
 
 
 def relax(state: State) -> dict:
@@ -252,6 +263,8 @@ def generate(state: State) -> dict:
         f"    {c['summary']}"
         for i, c in enumerate(state["candidates"])
     )
+    count = state.get("count") or DEFAULT_COUNT
+    length = "2~3문장" if count <= 5 else "1~2문장"
     hist = state.get("history") or []
     prev_txt = "\n".join(f"- 질문: {h['q']} / 추천했던 게임: {', '.join(h['recs']) or '없음'}"
                          for h in hist[-3:]) or "없음"
@@ -275,9 +288,10 @@ def generate(state: State) -> dict:
 {context}
 
 [답변 규칙]
-- 질문 조건에 가장 잘 맞는 게임 3개를 골라 추천해.
+- 질문 조건에 가장 잘 맞는 게임 {count}개를 골라, 잘 맞는 순서대로 번호를 붙여 추천해.
+  조건에 맞는 후보가 {count}개보다 적으면 억지로 채우지 말고 맞는 것만 추천해.
 - 이전 대화에서 이미 추천했던 게임은 다시 추천하지 마.
-- 각 게임마다 왜 이 사용자에게 맞는지 플레이 기록과 연결해서 2~3문장으로 설명해.
+- 각 게임마다 왜 이 사용자에게 맞는지 플레이 기록과 연결해서 {length}으로 설명해.
 - 보유했지만 거의 안 한 게임이 조건에 맞으면 먼저 추천하고 "이미 갖고 있는 게임"이라고 알려줘.
 - 마지막 줄에 "근거: 내 플레이 기록 · 스토어 게임 설명"이라고 적어.
 - 한국어, 친근한 말투로."""
@@ -294,7 +308,8 @@ def route_after_profile(state: State) -> str:
 
 
 def route_after_retrieve(state: State) -> str:
-    if len(state["candidates"]) < MIN_CANDS and state.get("relax_count", 0) < MAX_RELAX:
+    need = max(MIN_CANDS, (state.get("count") or DEFAULT_COUNT) + 2)
+    if len(state["candidates"]) < need and state.get("relax_count", 0) < MAX_RELAX:
         return "relax"
     return "generate"
 

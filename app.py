@@ -59,6 +59,8 @@ with st.sidebar:
         load(default_id)
 
     if ss.profile:
+        st.slider("추천 개수", 3, 8, agent.DEFAULT_COUNT, key="count",
+                  help="질문에 '10개 추천해줘'처럼 숫자를 쓰면 그 숫자가 우선이에요 (최대 10개).")
         owned = list(ss.profile["owned"].values())
         total_h = sum(g["playtime_forever"] for g in owned) / 60
         unplayed = sum(1 for g in owned if g["playtime_forever"] == 0)
@@ -139,7 +141,8 @@ if question and not limit_reached:
 
         agent.on_token = on_token
         final = {"question": question, "steamid": ss.steamid, "profile": ss.profile,
-                 "history": ss.memory.get("history", []), "exclude": ss.memory.get("exclude", [])}
+                 "history": ss.memory.get("history", []), "exclude": ss.memory.get("exclude", []),
+                 "count": ss.get("count", agent.DEFAULT_COUNT)}
         answer, details = None, None
         try:
             for chunk in agent.app.stream(dict(final), stream_mode="updates"):
