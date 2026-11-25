@@ -15,7 +15,7 @@ from google import genai
 from google.genai import errors, types
 from langgraph.graph import END, START, StateGraph
 
-from steam_api import get_owned_games, resolve_steamid
+from steam_api import get_owned_games, get_prices, resolve_steamid
 
 load_dotenv()
 
@@ -23,6 +23,8 @@ PLAYED_MIN = 600   # 이만큼(분) 이상 플레이한 게임은 추천에서 �
 MIN_CANDS = 6      # 후보가 이보다 적으면 조건을 완화해서 다시 검색
 MAX_RELAX = 2      # 조건 완화는 최대 2번까지
 DEFAULT_COUNT = 5  # 기본 추천 개수
+STORE_URL = "https://store.steampowered.com/app/{appid}/"                   # 스팀 상점 페이지
+IMAGE_URL = "https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg"  # 대표 이미지
 MAX_COUNT = 10     # 최대 추천 개수
 
 llm = genai.Client(
@@ -138,25 +140,49 @@ class State(TypedDict, total=False):
     history: list        # 이전 대화 [{"q": 질문, "recs": [추천한 게임]}] (최근 몇 개)
     exclude: list        # 이미 추천한 게임 이름 (다시 추천하지 않음)
     count: int           # 추천 개수
+    friend: dict         # 같이 할 친구의 플레이 기록 (없으면 혼자 추천)
+    likes: list          # 좋아요 누른 게임 [{"name", "genres"}]
+    dislikes: list       # 별로예요 누른 게임 [{"name", "genres"}]
 
 
 # =====================================================================
 # 노드
 # =====================================================================
-def load_profile(state: State) -> dict:
-    """[노드 1] Steam API로 플레이 기록 불러오기 (이미 있으면 건너뜀)"""
-    if state.get("profile") or not state.get("steamid"):
-        return {}
-    games = get_owned_games(state["steamid"])
+def make_profile(steamid: str) -> dict | None:
+    """Steam ID → 플레이 기록 요약 (나와 친구 모두 이 함수로 불러옴)"""
+    games = get_owned_games(steamid)
     if not games:
-        return {}
-    return {"profile": {
+        return None
+    return {
         "count": len(games),
         "top": [f"{g['name']} ({g['playtime_forever'] / 60:.0f}h)" for g in games[:10]],
         "recent": [f"{g['name']} ({g['playtime_2weeks'] / 60:.1f}h)"
                    for g in games if g.get("playtime_2weeks")],
         "owned": {g["appid"]: g for g in games},
-    }}
+    }
+
+
+def load_profile(state: State) -> dict:
+    """[노드 1] Steam API로 플레이 기록 불러오기 (이미 있으면 건너뜀)"""
+    if state.get("profile") or not state.get("steamid"):
+        return {}
+    prof = make_profile(state["steamid"])
+    return {"profile": prof} if prof else {}
+
+
+def names_of(items: list) -> str:
+    return ", ".join(x["name"] for x in items) if items else ""
+
+
+def price_text(c: dict) -> str:
+    """후보 게임의 현재 가격 문구"""
+    if c.get("free"):
+        return "무료"
+    if not c.get("price_now"):
+        return "가격 정보 없음"
+    if c.get("discount"):
+        return f"{c['price_now']} ({c['discount']}% 할인 중, 정가 {c['price_orig']})"
+    return c["price_now"]
 
 
 def ask_steam_id(state: State) -> dict:
@@ -168,10 +194,19 @@ def ask_steam_id(state: State) -> dict:
 def analyze(state: State) -> dict:
     """[노드 2] 한국어 질문 → 영어 검색어(1~3개) + 조건"""
     p = state["profile"]
+    friend = state.get("friend")
     hist = state.get("history") or []
     prev = "\n".join(f'- "{h["q"]}" → recommended: {", ".join(h["recs"]) or "none"}' for h in hist[-3:])
+    extra = ""
+    if friend:
+        extra += (f"\nThe user will play TOGETHER with a friend. Friend's most played games: "
+                  f"{', '.join(friend['top'])}\nWrite queries for multiplayer/co-op games both would enjoy.")
+    if state.get("likes"):
+        extra += f"\nGames the user LIKED before (find similar ones): {names_of(state['likes'])}"
+    if state.get("dislikes"):
+        extra += f"\nGames the user DISLIKED (avoid similar ones): {names_of(state['dislikes'])}"
     prompt = f"""You turn a Korean game-recommendation request into a search plan.
-User's most played games: {', '.join(p['top'])}
+User's most played games: {', '.join(p['top'])}{extra}
 Previous requests in this conversation (oldest first):
 {prev or '- (none)'}
 New request: "{state['question']}"
@@ -187,11 +222,14 @@ Return JSON with these keys:
 - "coop": true if they want to play together with friends, otherwise null
 - "single": true if they want to play alone, otherwise null
 - "owned_only": true only if they want games they already own, otherwise false
-- "count": the number of games they explicitly asked for (e.g. "10개" → 10), otherwise null"""
+- "count": the number of games they explicitly asked for (e.g. "10개" → 10), otherwise null
+- "sale_only": true if they want games that are currently on sale/discounted (세일, 할인), otherwise false"""
     plan = json.loads(ask_llm(prompt, json_mode=True, light=True))
     if isinstance(plan.get("queries"), str):
         plan["queries"] = [plan["queries"]]
-    filters = {k: True for k in ("coop", "single", "owned_only") if plan.get(k)}
+    filters = {k: True for k in ("coop", "single", "owned_only", "sale_only") if plan.get(k)}
+    if friend and not plan.get("single"):
+        filters["together"] = True  # 친구와 같이 → 멀티플레이 또는 협동 게임만
     try:  # 질문에 숫자가 있으면 그 숫자, 없으면 화면에서 고른 개수
         count = int(plan.get("count") or state.get("count") or DEFAULT_COUNT)
     except (TypeError, ValueError):
@@ -202,6 +240,8 @@ Return JSON with these keys:
 
 def build_where(filters: dict, profile: dict) -> dict | None:
     conds = [{k: True} for k in ("coop", "single") if filters.get(k)]
+    if filters.get("together"):
+        conds.append({"$or": [{"coop": True}, {"multi": True}]})
     if filters.get("owned_only"):
         conds.append({"appid": {"$in": [int(a) for a in profile["owned"]]}})
     if len(conds) > 1:
@@ -212,11 +252,15 @@ def build_where(filters: dict, profile: dict) -> dict | None:
 def retrieve(state: State) -> dict:
     """[노드 3] 검색어마다 벡터 DB 검색 → 합치기 → 이미 많이 한 게임 제외"""
     profile = state["profile"]
-    exclude = set(state.get("exclude") or [])
+    friend = state.get("friend")
+    sale_only = state["filters"].get("sale_only")
+    exclude = set(state.get("exclude") or []) | {d["name"] for d in state.get("dislikes") or []}
     queries = state["plan"].get("queries") or [state["question"]]
     where = build_where(state["filters"], profile)
     count = state.get("count") or DEFAULT_COUNT
     want = max(15, count * 3)  # 추천 개수의 3배만큼 후보 확보
+    if sale_only:
+        want *= 3  # 세일 중인 게임만 고르려면 더 많이 찾아봐야 함
     n_each = max(6, want // len(queries) + 2) + min(len(exclude), 12)  # 제외할 게임만큼 더 검색
 
     seen, cands = set(), []
@@ -230,24 +274,41 @@ def retrieve(state: State) -> dict:
             minutes = mine["playtime_forever"] if mine else 0
             if minutes >= PLAYED_MIN:
                 continue
+            fr = friend["owned"].get(m["appid"]) if friend else None
             cands.append({
                 "name": m["name"], "genres": m["genres"], "modes": m["categories"],
                 "positive": m["positive_ratio"], "median_hours": m["median_playtime_hours"],
                 "owned": f"보유 중 ({minutes / 60:.0f}시간 플레이)" if mine else "미보유",
+                "is_owned": bool(mine), "price": m.get("price", 0),
+                "friend_owned": bool(fr),
+                "friend_hours": round(fr["playtime_forever"] / 60) if fr else 0,
+                "appid": m["appid"],
+                "store_url": STORE_URL.format(appid=m["appid"]),
+                "image": IMAGE_URL.format(appid=m["appid"]),
                 "query": q, "dist": dist, "summary": doc[:400],
             })
     cands.sort(key=lambda c: c["dist"])
-    print(f"      후보 {len(cands)}개 (조건: {state['filters'] or '없음'})")
-    return {"candidates": cands[:want]}
+    cands = cands[:want]
+
+    # 실시간 가격·할인 (스팀 상점, 원화 기준)
+    prices = get_prices([c["appid"] for c in cands])
+    for c in cands:
+        pr = prices.get(c["appid"])
+        if pr:
+            c.update(free=pr["free"], price_now=pr["now"], price_orig=pr["orig"], discount=pr["discount"])
+    if sale_only:
+        cands = [c for c in cands if c.get("discount")]
+    print(f"      후보 {len(cands)}개 (조건: {state['filters'] or '없음'}, 가격 {len(prices)}개 조회)")
+    return {"candidates": cands[:max(15, count * 3)]}
 
 
 def relax(state: State) -> dict:
-    """[노드 3-1] 후보가 부족할 때 조건 완화: 1차는 협동/싱글 조건, 2차는 전부 해제"""
+    """[노드 3-1] 후보가 부족할 때 조건 완화: 1차는 협동/싱글/세일 조건, 2차는 전부 해제"""
     f = dict(state["filters"])
     count = state.get("relax_count", 0) + 1
-    if count == 1 and ("coop" in f or "single" in f):
-        f.pop("coop", None)
-        f.pop("single", None)
+    if count == 1 and any(k in f for k in ("coop", "single", "sale_only")):
+        for k in ("coop", "single", "sale_only"):
+            f.pop(k, None)
     else:
         f = {}
     print(f"      조건 완화 {count}차 → {f or '조건 없음'}")
@@ -259,7 +320,10 @@ def generate(state: State) -> dict:
     p = state["profile"]
     context = "\n".join(
         f"[{i + 1}] {c['name']} | 장르: {c['genres']} | 방식: {c['modes']} | "
-        f"긍정 {c['positive']:.0%} | 보통 총 플레이 {c['median_hours']}시간 | {c['owned']}\n"
+        f"긍정 {c['positive']:.0%} | 보통 총 플레이 {c['median_hours']}시간 | {c['owned']} | "
+        + (f"친구: {'보유 (' + str(c['friend_hours']) + '시간)' if c['friend_owned'] else '미보유'} | "
+           if state.get("friend") else "")
+        + f"가격: {price_text(c)} | 상점: {c['store_url']}\n"
         f"    {c['summary']}"
         for i, c in enumerate(state["candidates"])
     )
@@ -268,6 +332,16 @@ def generate(state: State) -> dict:
     hist = state.get("history") or []
     prev_txt = "\n".join(f"- 질문: {h['q']} / 추천했던 게임: {', '.join(h['recs']) or '없음'}"
                          for h in hist[-3:]) or "없음"
+    friend = state.get("friend")
+    friend_txt = (f"\n[같이 할 친구]\n- 보유 게임 {friend['count']}개\n"
+                  f"- 많이 한 게임: {', '.join(friend['top'])}\n") if friend else ""
+    feedback_txt = ""
+    if state.get("likes"):
+        feedback_txt += f"\n- 좋아요 누른 게임: {names_of(state['likes'])} (이런 게임과 비슷한 걸 더 좋아함)"
+    if state.get("dislikes"):
+        feedback_txt += f"\n- 별로예요 누른 게임: {names_of(state['dislikes'])} (이런 느낌은 피하기)"
+    friend_rule = ("\n- 친구와 같이 할 게임을 추천하는 거야. 나와 친구의 플레이 기록을 모두 연결해서 설명하고, "
+                   "둘 다 가진 게임이면 '둘 다 갖고 있어서 바로 같이 시작할 수 있다'고 먼저 추천해.") if friend else ""
     relaxed = ("\n(참고: 조건에 딱 맞는 후보가 부족해서 조건을 조금 넓혀 찾은 후보도 있어. "
                "그런 게임은 어떤 점이 조건과 다른지 짧게 알려줘.)") if state.get("relax_count") else ""
     prompt = f"""너는 스팀 게임 추천 도우미야. 아래 [사용자 정보]와 [후보 게임]만 근거로 답해.
@@ -277,7 +351,7 @@ def generate(state: State) -> dict:
 - 보유 게임 {p['count']}개
 - 많이 한 게임: {', '.join(p['top'])}
 - 최근 2주 플레이: {', '.join(p['recent']) or '없음'}
-
+{friend_txt}{feedback_txt}
 [이전 대화]
 {prev_txt}
 
@@ -293,6 +367,8 @@ def generate(state: State) -> dict:
 - 이전 대화에서 이미 추천했던 게임은 다시 추천하지 마.
 - 각 게임마다 왜 이 사용자에게 맞는지 플레이 기록과 연결해서 {length}으로 설명해.
 - 보유했지만 거의 안 한 게임이 조건에 맞으면 먼저 추천하고 "이미 갖고 있는 게임"이라고 알려줘.
+- 추천하는 게임 이름은 반드시 [게임 이름](상점 주소) 형식의 링크로 써. 게임 이름은 후보 목록과 똑같이 써.
+- 할인 중인 게임은 할인율과 가격을 짧게 알려줘. 그 외 가격은 꼭 필요할 때만 언급해.{friend_rule}
 - 마지막 줄에 "근거: 내 플레이 기록 · 스토어 게임 설명"이라고 적어.
 - 한국어, 친근한 말투로."""
     if on_token:
@@ -347,9 +423,16 @@ LABELS = {
 }
 
 
+def ranked_picks(answer: str, candidates: list) -> list[dict]:
+    """답변에 실제로 등장한 후보 게임을, 답변에 나온 순서(=추천 순위)대로 정렬"""
+    answer = answer or ""
+    found = [(answer.find(c["name"]), c) for c in candidates if c["name"] in answer]
+    return [c for _, c in sorted(found, key=lambda x: x[0])]
+
+
 def recommended_names(answer: str, candidates: list) -> list[str]:
-    """답변에 실제로 등장한 후보 게임 이름 = 이번에 추천한 게임"""
-    return [c["name"] for c in candidates if c["name"] in (answer or "")]
+    """이번에 추천한 게임 이름 (대화 기억용)"""
+    return [c["name"] for c in ranked_picks(answer, candidates)]
 
 
 def remember(memory: dict, question: str, result: dict):
