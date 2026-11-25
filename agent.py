@@ -15,7 +15,7 @@ from google import genai
 from google.genai import errors, types
 from langgraph.graph import END, START, StateGraph
 
-from steam_api import get_owned_games, get_prices, resolve_steamid
+from steam_api import get_owned_games, get_prices, get_reviews_many, resolve_steamid
 
 load_dotenv()
 
@@ -26,6 +26,7 @@ DEFAULT_COUNT = 5  # 기본 추천 개수
 STORE_URL = "https://store.steampowered.com/app/{appid}/"                   # 스팀 상점 페이지
 IMAGE_URL = "https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg"  # 대표 이미지
 MAX_COUNT = 10     # 최대 추천 개수
+REVIEW_TOP = 10    # 리뷰를 가져올 후보 수 (검색 순위 상위)
 
 llm = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY"),
@@ -174,6 +175,17 @@ def names_of(items: list) -> str:
     return ", ".join(x["name"] for x in items) if items else ""
 
 
+def review_text(c: dict) -> str:
+    """프롬프트에 넣을 리뷰 요약 (없으면 빈 문자열)"""
+    rv = c.get("reviews")
+    if not rv:
+        return ""
+    head = f"\n    [리뷰] {rv['lang']} 평가 {rv['summary']} ({rv['total']:,}개)"
+    lines = [f"\n      - ({'추천' if it['up'] else '비추천'}, {it['hours']}시간 플레이) {it['text']}"
+             for it in rv["items"]]
+    return head + "".join(lines)
+
+
 def price_text(c: dict) -> str:
     """후보 게임의 현재 가격 문구"""
     if c.get("free"):
@@ -298,8 +310,17 @@ def retrieve(state: State) -> dict:
             c.update(free=pr["free"], price_now=pr["now"], price_orig=pr["orig"], discount=pr["discount"])
     if sale_only:
         cands = [c for c in cands if c.get("discount")]
-    print(f"      후보 {len(cands)}개 (조건: {state['filters'] or '없음'}, 가격 {len(prices)}개 조회)")
-    return {"candidates": cands[:max(15, count * 3)]}
+    cands = cands[:max(15, count * 3)]
+
+    # 실제 플레이어 리뷰 (상위 후보만, 병렬로 가져옴)
+    top = cands[:max(REVIEW_TOP, count + 3)]
+    reviews = get_reviews_many([c["appid"] for c in top])
+    for c in top:
+        if reviews.get(c["appid"]):
+            c["reviews"] = reviews[c["appid"]]
+    print(f"      후보 {len(cands)}개 (조건: {state['filters'] or '없음'}, "
+          f"가격 {len(prices)}개 · 리뷰 {len(reviews)}개 조회)")
+    return {"candidates": cands}
 
 
 def relax(state: State) -> dict:
@@ -325,6 +346,7 @@ def generate(state: State) -> dict:
            if state.get("friend") else "")
         + f"가격: {price_text(c)} | 상점: {c['store_url']}\n"
         f"    {c['summary']}"
+        + review_text(c)
         for i, c in enumerate(state["candidates"])
     )
     count = state.get("count") or DEFAULT_COUNT
@@ -368,8 +390,10 @@ def generate(state: State) -> dict:
 - 각 게임마다 왜 이 사용자에게 맞는지 플레이 기록과 연결해서 {length}으로 설명해.
 - 보유했지만 거의 안 한 게임이 조건에 맞으면 먼저 추천하고 "이미 갖고 있는 게임"이라고 알려줘.
 - 추천하는 게임 이름은 반드시 [게임 이름](상점 주소) 형식의 링크로 써. 게임 이름은 후보 목록과 똑같이 써.
+- [리뷰]가 있는 게임은 실제 플레이어 리뷰 내용을 짧게 인용하거나 요약해서 근거로 써
+  (예: 리뷰에서 "친구랑 하면 시간 순삭"이라는 평이 많아요). 리뷰에 없는 내용을 리뷰라고 지어내지 마.
 - 할인 중인 게임은 할인율과 가격을 짧게 알려줘. 그 외 가격은 꼭 필요할 때만 언급해.{friend_rule}
-- 마지막 줄에 "근거: 내 플레이 기록 · 스토어 게임 설명"이라고 적어.
+- 마지막 줄에 "근거: 내 플레이 기록 · 스토어 게임 설명 · 플레이어 리뷰"라고 적어.
 - 한국어, 친근한 말투로."""
     if on_token:
         return {"answer": ask_llm_stream(prompt, on_token)}

@@ -210,6 +210,21 @@ def show_picks(picks: list, prefix: str):
             st.caption(" · ".join(info))
             st.caption(g["genres"])
 
+            rv = g.get("reviews")
+            if rv:
+                st.caption(f"🗣️ {rv['lang']} 리뷰 **{rv['summary']}** ({rv['total']:,}개)")
+                first = rv["items"][0]
+                st.markdown(f"> {'👍' if first['up'] else '👎'} {first['text']}  \n"
+                            f"> <small>— {first['hours']}시간 플레이</small>", unsafe_allow_html=True)
+                if len(rv["items"]) > 1:
+                    with st.expander("리뷰 더 보기"):
+                        for it in rv["items"][1:]:
+                            st.markdown(f"{'👍' if it['up'] else '👎'} {it['text']}  \n"
+                                        f"<small>— {it['hours']}시간 플레이 · 도움됨 {it['votes']}</small>",
+                                        unsafe_allow_html=True)
+                        st.link_button("스팀에서 리뷰 전체 보기", g["store_url"] + "#app_reviews_hash",
+                                       use_container_width=True)
+
             b1, b2 = st.columns(2)
             b1.link_button("스팀 상점", g["store_url"], use_container_width=True)
             b2.link_button("🎬 영상 보기",
@@ -297,7 +312,7 @@ if question and not limit_reached:
                     final.update(upd or {})
                     status.write(f"✅ {agent.LABELS.get(node, node)}")
                     if node == "analyze":
-                        status.update(label="비슷한 게임과 현재 가격을 찾는 중...")
+                        status.update(label="비슷한 게임과 가격·리뷰를 찾는 중...")
                     elif node == "relax":
                         status.update(label="후보가 부족해서 조건을 넓혀 다시 검색하는 중...")
                     elif node == "retrieve":
